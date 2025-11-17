@@ -5,9 +5,7 @@ const axios = require("axios");
 
 const app = express();
 
-/* -------------------------------------------
-   CORS FIX — allows Vercel frontend to call backend
--------------------------------------------- */
+// CORS
 app.use(
   cors({
     origin: [
@@ -21,59 +19,42 @@ app.use(
 
 app.use(express.json());
 
-/* -------------------------------------------
-   Health check
--------------------------------------------- */
+// Health
 app.get("/", (req, res) => {
   res.json({ message: "YT to Spotify backend is running." });
 });
 
 /* -------------------------------------------
-   Helper: Get YouTube metadata (no API key)
+   Get YouTube title
 -------------------------------------------- */
 async function getYouTubeMetadata(url) {
   const oembed = "https://www.youtube.com/oembed";
 
   const response = await axios.get(oembed, {
-    params: {
-      url,
-      format: "json",
-    },
+    params: { url, format: "json" }
   });
 
   return response.data.title;
 }
 
 /* -------------------------------------------
-   Helper: Clean YouTube title → search query
+   Clean title
 -------------------------------------------- */
 function cleanTitle(title) {
   if (!title) return "";
-
   let t = title;
 
-  // remove brackets (Official Video), [HD], etc.
   t = t.replace(/\(.*?\)/g, "").replace(/\[.*?\]/g, "");
 
-  // remove known noise
   const noise = [
-    "official music video",
-    "official video",
-    "music video",
-    "video",
-    "lyrics",
-    "audio",
-    "remaster",
-    "hd",
-    "4k",
+    "official music video","official video","music video","video",
+    "lyrics","audio","remaster","hd","4k"
   ];
 
   let lower = t.toLowerCase();
   noise.forEach((n) => (lower = lower.replace(n, "")));
-
   lower = lower.replace(/\s+/g, " ").trim();
 
-  // format: artist - title
   const dash = lower.split(" - ");
   if (dash.length >= 2) {
     const artist = dash[0].trim();
@@ -85,7 +66,7 @@ function cleanTitle(title) {
 }
 
 /* -------------------------------------------
-   Helper: Normalize strings for matching
+   Normalize + similarity
 -------------------------------------------- */
 function normalize(str) {
   return str
@@ -95,14 +76,11 @@ function normalize(str) {
     .trim();
 }
 
-/* -------------------------------------------
-   Helper: Token-based similarity (Jaccard)
--------------------------------------------- */
 function similarity(a, b) {
   const aTokens = new Set(normalize(a).split(" "));
   const bTokens = new Set(normalize(b).split(" "));
-
   let match = 0;
+
   aTokens.forEach((t) => {
     if (bTokens.has(t)) match++;
   });
@@ -112,15 +90,11 @@ function similarity(a, b) {
 }
 
 /* -------------------------------------------
-   Spotify Auth
+   Spotify auth + search
 -------------------------------------------- */
 async function getSpotifyToken() {
   const id = process.env.SPOTIFY_CLIENT_ID;
   const secret = process.env.SPOTIFY_CLIENT_SECRET;
-
-  if (!id || !secret) {
-    throw new Error("Missing Spotify credentials");
-  }
 
   const tokenRes = await axios.post(
     "https://accounts.spotify.com/api/token",
@@ -137,19 +111,12 @@ async function getSpotifyToken() {
   return tokenRes.data.access_token;
 }
 
-/* -------------------------------------------
-   Spotify search
--------------------------------------------- */
 async function searchSpotify(query) {
   const token = await getSpotifyToken();
 
   const res = await axios.get("https://api.spotify.com/v1/search", {
     headers: { Authorization: `Bearer ${token}` },
-    params: {
-      q: query,
-      type: "track",
-      limit: 5,
-    },
+    params: { q: query, type: "track", limit: 5 },
   });
 
   const items = res.data.tracks.items || [];
@@ -165,19 +132,13 @@ async function searchSpotify(query) {
 
     let score = similarity(full, query);
 
-    const lowerFull = full.toLowerCase();
-    const lowerQuery = query.toLowerCase();
-
-    if (lowerFull.includes("live") !== lowerQuery.includes("live")) {
+    if (full.toLowerCase().includes("live") !== query.toLowerCase().includes("live"))
       score -= 0.1;
-    }
 
     if (
-      lowerFull.includes("remix") !== lowerQuery.includes("remix") ||
-      lowerFull.includes("mix") !== lowerQuery.includes("mix")
-    ) {
+      full.toLowerCase().includes("remix") !== query.toLowerCase().includes("remix")
+    )
       score -= 0.1;
-    }
 
     if (score > bestScore) {
       bestScore = score;
@@ -189,7 +150,7 @@ async function searchSpotify(query) {
 }
 
 /* -------------------------------------------
-   Apple Music Search (iTunes API)
+   Apple search
 -------------------------------------------- */
 async function searchApple(query) {
   const res = await axios.get("https://itunes.apple.com/search", {
@@ -209,7 +170,7 @@ async function searchApple(query) {
 
   for (const item of items) {
     const full = `${item.artistName} ${item.trackName}`;
-    let score = similarity(full, query);
+    const score = similarity(full, query);
 
     if (score > bestScore) {
       bestScore = score;
@@ -221,23 +182,19 @@ async function searchApple(query) {
 }
 
 /* -------------------------------------------
-   MAIN ROUTE — /api/convert
+   MAIN ROUTE
 -------------------------------------------- */
 app.post("/api/convert", async (req, res) => {
   try {
     const { youtubeUrl } = req.body;
 
-    if (!youtubeUrl) {
-      return res.status(400).json({ error: "YouTube URL required" });
-    }
-
-    // STEP 1 — Get YT title
+    // 1. YouTube title
     const rawTitle = await getYouTubeMetadata(youtubeUrl);
 
-    // STEP 2 — Clean title
+    // 2. Clean title
     const cleanedQuery = cleanTitle(rawTitle);
 
-    // STEP 3 — Spotify + Apple search
+    // 3. Spotify + Apple search
     const [sp, ap] = await Promise.allSettled([
       searchSpotify(cleanedQuery),
       searchApple(cleanedQuery),
@@ -258,39 +215,40 @@ app.post("/api/convert", async (req, res) => {
       appleUrl = ap.value.track.trackViewUrl;
     }
 
-    // STEP 4 — Confidence
-    let score = 0;
-    if (spotifyScore && appleScore) score = spotifyScore * 0.6 + appleScore * 0.4;
-    else if (spotifyScore) score = spotifyScore;
-    else if (appleScore) score = appleScore;
+    // Confidence
+    let score =
+      spotifyScore && appleScore
+        ? spotifyScore * 0.6 + appleScore * 0.4
+        : spotifyScore || appleScore;
 
-    let confidence = Math.round(score * 100);
-    confidence = Math.max(0, Math.min(confidence, 100));
+    let confidence = Math.round((score || 0) * 100);
+    confidence = Math.min(Math.max(confidence, 0), 100);
 
-    // STEP 5 — If confidence too low (<74) use search URLs instead
-    const searchSpotifyUrl = `https://open.spotify.com/search/${encodeURIComponent(
+    // 4. FIXED SOUNDCLOUD URL (works in PWA)
+    const soundCloudUrl =
+      "https://soundcloud.com/search/sounds?q=" +
+      encodeURIComponent(cleanedQuery);
+
+    // Fallback: low confidence → search links
+    const spotifySearch = `https://open.spotify.com/search/${encodeURIComponent(
       cleanedQuery
     )}`;
-    const searchAppleUrl = `https://music.apple.com/us/search?term=${encodeURIComponent(
+    const appleSearch = `https://music.apple.com/us/search?term=${encodeURIComponent(
       cleanedQuery
     )}`;
 
     if (confidence < 74) {
-      spotifyUrl = searchSpotifyUrl;
-      appleUrl = searchAppleUrl;
+      spotifyUrl = spotifySearch;
+      appleUrl = appleSearch;
     }
 
-    const soundCloudUrl =
-      "https://soundcloud.com/search?q=" + encodeURIComponent(cleanedQuery);
-
-    // Match category
-    let matchType = "very_low";
+    // Match level
+    let matchType = "low";
     if (confidence >= 90) matchType = "exact";
     else if (confidence >= 75) matchType = "high";
     else if (confidence >= 50) matchType = "medium";
-    else matchType = "low";
 
-    // SEND RESPONSE
+    // Response
     res.json({
       youtubeUrl,
       youtubeTitle: rawTitle,
@@ -300,13 +258,9 @@ app.post("/api/convert", async (req, res) => {
       spotifyUrl,
       appleMusicUrl: appleUrl,
       soundCloudUrl,
-      debug: {
-        spotifyScore,
-        appleScore,
-      },
     });
   } catch (err) {
-    console.error("ERROR /api/convert:", err.response?.data || err.message);
+    console.error("Convert error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -316,5 +270,5 @@ app.post("/api/convert", async (req, res) => {
 -------------------------------------------- */
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () =>
-  console.log(`Backend running on http://localhost:${PORT}`)
+  console.log(`Backend running on port ${PORT}`)
 );
