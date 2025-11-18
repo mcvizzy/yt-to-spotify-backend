@@ -5,68 +5,131 @@ const axios = require("axios");
 
 const app = express();
 
-// CORS
+// CORS: allow your frontend & local dev
 app.use(
   cors({
     origin: [
       "https://yt-to-spotify-frontend.vercel.app",
-      "http://localhost:5173"
+      "http://localhost:5173",
     ],
     methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"]
+    allowedHeaders: ["Content-Type"],
   })
 );
 
 app.use(express.json());
 
-// Health
+// Health check
 app.get("/", (req, res) => {
-  res.json({ message: "YT to Spotify backend is running." });
+  res.json({ message: "YT → Music backend is running." });
 });
 
 /* -------------------------------------------
-   Get YouTube title
+   Platform detection (YouTube / TikTok)
 -------------------------------------------- */
-async function getYouTubeMetadata(url) {
-  const oembed = "https://www.youtube.com/oembed";
-
-  const response = await axios.get(oembed, {
-    params: { url, format: "json" }
-  });
-
-  return response.data.title;
+function detectPlatform(url) {
+  const lower = url.toLowerCase();
+  if (lower.includes("youtube.com") || lower.includes("youtu.be")) {
+    return "youtube";
+  }
+  if (lower.includes("tiktok.com")) {
+    return "tiktok";
+  }
+  return "unknown";
 }
 
 /* -------------------------------------------
-   Clean title
+   Fetch metadata from YouTube / TikTok
 -------------------------------------------- */
-function cleanTitle(title) {
-  if (!title) return "";
-  let t = title;
+async function getTrackMetadata(inputUrl) {
+  const platform = detectPlatform(inputUrl);
 
-  t = t.replace(/\(.*?\)/g, "").replace(/\[.*?\]/g, "");
+  if (platform === "youtube") {
+    // YouTube oEmbed
+    const res = await axios.get("https://www.youtube.com/oembed", {
+      params: { url: inputUrl, format: "json" },
+    });
 
+    return {
+      platform,
+      title: res.data.title || "",
+      // YouTube doesn't give artist separately here
+      artist: "",
+    };
+  }
+
+  if (platform === "tiktok") {
+    // TikTok oEmbed
+    const res = await axios.get("https://www.tiktok.com/oembed", {
+      params: { url: inputUrl },
+    });
+
+    return {
+      platform,
+      title: res.data.title || "",
+      artist: res.data.author_name || "",
+    };
+  }
+
+  throw new Error("Unsupported URL. Use YouTube or TikTok links.");
+}
+
+/* -------------------------------------------
+   Title cleaning → search query
+-------------------------------------------- */
+function cleanTitleForSearch({ platform, title, artist }) {
+  let base = "";
+
+  if (platform === "tiktok") {
+    // Use "artist + title" for TikTok
+    base = `${artist} ${title}`.trim();
+  } else {
+    // YouTube: just title
+    base = title || "";
+  }
+
+  if (!base) return "";
+
+  // Remove bracketed junk
+  base = base.replace(/\(.*?\)/g, "").replace(/\[.*?\]/g, "");
+
+  // Remove noise words
   const noise = [
-    "official music video","official video","music video","video",
-    "lyrics","audio","remaster","hd","4k"
+    "official music video",
+    "official video",
+    "music video",
+    "video",
+    "lyrics",
+    "audio",
+    "remaster",
+    "remastered",
+    "hd",
+    "4k",
+    "tiktok",
+    "sound",
   ];
 
-  let lower = t.toLowerCase();
-  noise.forEach((n) => (lower = lower.replace(n, "")));
+  let lower = base.toLowerCase();
+  noise.forEach((n) => {
+    lower = lower.replace(n, "");
+  });
+
+  // Collapse whitespace
   lower = lower.replace(/\s+/g, " ").trim();
 
+  // Handle artist - track case
   const dash = lower.split(" - ");
   if (dash.length >= 2) {
-    const artist = dash[0].trim();
-    const track = dash.slice(1).join(" - ").trim();
-    return `${artist} ${track}`.trim();
+    const artistPart = dash[0].trim();
+    const trackPart = dash.slice(1).join(" - ").trim();
+    return `${artistPart} ${trackPart}`.trim();
   }
 
   return lower;
 }
 
 /* -------------------------------------------
-   Normalize + similarity
+   Normalization + similarity
 -------------------------------------------- */
 function normalize(str) {
   return str
@@ -77,10 +140,12 @@ function normalize(str) {
 }
 
 function similarity(a, b) {
-  const aTokens = new Set(normalize(a).split(" "));
-  const bTokens = new Set(normalize(b).split(" "));
-  let match = 0;
+  const aTokens = new Set(normalize(a).split(" ").filter(Boolean));
+  const bTokens = new Set(normalize(b).split(" ").filter(Boolean));
 
+  if (!aTokens.size || !bTokens.size) return 0;
+
+  let match = 0;
   aTokens.forEach((t) => {
     if (bTokens.has(t)) match++;
   });
@@ -95,6 +160,10 @@ function similarity(a, b) {
 async function getSpotifyToken() {
   const id = process.env.SPOTIFY_CLIENT_ID;
   const secret = process.env.SPOTIFY_CLIENT_SECRET;
+
+  if (!id || !secret) {
+    throw new Error("Missing Spotify credentials");
+  }
 
   const tokenRes = await axios.post(
     "https://accounts.spotify.com/api/token",
@@ -126,19 +195,24 @@ async function searchSpotify(query) {
   let bestScore = 0;
 
   for (const track of items) {
-    const name = track.name;
-    const artists = track.artists.map((a) => a.name).join(" ");
-    const full = `${artists} ${name}`;
+    const name = track.name || "";
+    const artists = (track.artists || []).map((a) => a.name).join(" ");
+    const full = `${artists} ${name}`.trim();
 
     let score = similarity(full, query);
 
-    if (full.toLowerCase().includes("live") !== query.toLowerCase().includes("live"))
-      score -= 0.1;
+    const lowerFull = full.toLowerCase();
+    const lowerQuery = query.toLowerCase();
 
-    if (
-      full.toLowerCase().includes("remix") !== query.toLowerCase().includes("remix")
-    )
+    if (lowerFull.includes("live") !== lowerQuery.includes("live")) {
       score -= 0.1;
+    }
+    if (
+      lowerFull.includes("remix") !== lowerQuery.includes("remix") ||
+      lowerFull.includes("mix") !== lowerQuery.includes("mix")
+    ) {
+      score -= 0.1;
+    }
 
     if (score > bestScore) {
       bestScore = score;
@@ -146,11 +220,11 @@ async function searchSpotify(query) {
     }
   }
 
-  return { track: best, score: bestScore };
+  return { track: best, score: Math.max(0, bestScore) };
 }
 
 /* -------------------------------------------
-   Apple search
+   Apple Music / iTunes search
 -------------------------------------------- */
 async function searchApple(query) {
   const res = await axios.get("https://itunes.apple.com/search", {
@@ -169,7 +243,7 @@ async function searchApple(query) {
   let bestScore = 0;
 
   for (const item of items) {
-    const full = `${item.artistName} ${item.trackName}`;
+    const full = `${item.artistName || ""} ${item.trackName || ""}`.trim();
     const score = similarity(full, query);
 
     if (score > bestScore) {
@@ -178,24 +252,30 @@ async function searchApple(query) {
     }
   }
 
-  return { track: best, score: bestScore };
+  return { track: best, score: Math.max(0, bestScore) };
 }
 
 /* -------------------------------------------
-   MAIN ROUTE
+   MAIN ROUTE — /api/convert
 -------------------------------------------- */
 app.post("/api/convert", async (req, res) => {
   try {
     const { youtubeUrl } = req.body;
+    const inputUrl = youtubeUrl;
 
-    // 1. YouTube title
-    const rawTitle = await getYouTubeMetadata(youtubeUrl);
+    if (!inputUrl) {
+      return res.status(400).json({ error: "URL is required" });
+    }
 
-    // 2. Clean title
-    const cleanedQuery = cleanTitle(rawTitle);
+    // 1. Detect platform & get metadata
+    const meta = await getTrackMetadata(inputUrl);
+    const { platform, title, artist } = meta;
 
-    // 3. Spotify + Apple search
-    const [sp, ap] = await Promise.allSettled([
+    // 2. Clean to search query
+    const cleanedQuery = cleanTitleForSearch(meta);
+
+    // 3. Search Spotify + Apple
+    const [spRes, apRes] = await Promise.allSettled([
       searchSpotify(cleanedQuery),
       searchApple(cleanedQuery),
     ]);
@@ -205,53 +285,62 @@ app.post("/api/convert", async (req, res) => {
     let spotifyScore = 0;
     let appleScore = 0;
 
-    if (sp.status === "fulfilled" && sp.value?.track) {
-      spotifyScore = sp.value.score;
-      spotifyUrl = `https://open.spotify.com/track/${sp.value.track.id}`;
+    if (spRes.status === "fulfilled" && spRes.value?.track) {
+      spotifyScore = spRes.value.score;
+      spotifyUrl = `https://open.spotify.com/track/${spRes.value.track.id}`;
     }
 
-    if (ap.status === "fulfilled" && ap.value?.track) {
-      appleScore = ap.value.score;
-      appleUrl = ap.value.track.trackViewUrl;
+    if (apRes.status === "fulfilled" && apRes.value?.track) {
+      appleScore = apRes.value.score;
+      appleUrl = apRes.value.track.trackViewUrl;
     }
 
-    // Confidence
-    let score =
-      spotifyScore && appleScore
-        ? spotifyScore * 0.6 + appleScore * 0.4
-        : spotifyScore || appleScore;
+    // 4. Confidence
+    let rawScore = 0;
+    if (spotifyScore && appleScore) {
+      rawScore = spotifyScore * 0.6 + appleScore * 0.4;
+    } else if (spotifyScore) {
+      rawScore = spotifyScore;
+    } else if (appleScore) {
+      rawScore = appleScore;
+    }
 
-    let confidence = Math.round((score || 0) * 100);
+    let confidence = Math.round(rawScore * 100);
+    if (Number.isNaN(confidence)) confidence = 0;
     confidence = Math.min(Math.max(confidence, 0), 100);
 
-    // 4. FIXED SOUNDCLOUD URL (works in PWA)
+    // 5. Search fallback if confidence low
+    const spotifySearchUrl = `https://open.spotify.com/search/${encodeURIComponent(
+      cleanedQuery
+    )}`;
+    const appleSearchUrl = `https://music.apple.com/us/search?term=${encodeURIComponent(
+      cleanedQuery
+    )}`;
+
+    if (confidence < 74 || !spotifyUrl) {
+      spotifyUrl = spotifySearchUrl;
+    }
+    if (confidence < 74 || !appleUrl) {
+      appleUrl = appleSearchUrl;
+    }
+
+    // SoundCloud search — PWA-safe format
     const soundCloudUrl =
       "https://soundcloud.com/search/sounds?q=" +
       encodeURIComponent(cleanedQuery);
 
-    // Fallback: low confidence → search links
-    const spotifySearch = `https://open.spotify.com/search/${encodeURIComponent(
-      cleanedQuery
-    )}`;
-    const appleSearch = `https://music.apple.com/us/search?term=${encodeURIComponent(
-      cleanedQuery
-    )}`;
-
-    if (confidence < 74) {
-      spotifyUrl = spotifySearch;
-      appleUrl = appleSearch;
-    }
-
-    // Match level
-    let matchType = "low";
+    // Match-level labels (for future UI use)
+    let matchType = "very_low";
     if (confidence >= 90) matchType = "exact";
     else if (confidence >= 75) matchType = "high";
     else if (confidence >= 50) matchType = "medium";
+    else matchType = "low";
 
-    // Response
     res.json({
-      youtubeUrl,
-      youtubeTitle: rawTitle,
+      platform, // "youtube" or "tiktok"
+      youtubeUrl: inputUrl,
+      youtubeTitle: title,
+      artist,
       cleanedQuery,
       confidence,
       matchType,
@@ -260,15 +349,15 @@ app.post("/api/convert", async (req, res) => {
       soundCloudUrl,
     });
   } catch (err) {
-    console.error("Convert error:", err);
+    console.error("Error in /api/convert:", err.response?.data || err.message);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
 /* -------------------------------------------
-   Start Server
+   Start server
 -------------------------------------------- */
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () =>
-  console.log(`Backend running on port ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+});
